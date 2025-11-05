@@ -1,0 +1,14 @@
+{
+  "watch": ["index.js"],
+  "ignore": [
+    "zips/**/*",
+    "temp/**/*",
+    "*.zip",
+    "node_modules/**/*",
+    ".git/**/*",
+    "test*.js"
+  ],
+  "ext": "js,json",
+  "delay": 1000
+}
+
