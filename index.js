@@ -149,11 +149,12 @@ class GitHubRepoZipService {
     let page = 1;
 
     while (true) {
-      const response = await this.octokit.repos.listForUser({
-        username: this.githubUsername,
+      // Use listForAuthenticatedUser to get both public and private repos
+      const response = await this.octokit.repos.listForAuthenticatedUser({
         per_page: 100,
         page,
         sort: 'updated',
+        affiliation: 'owner', // Only get repos owned by the authenticated user
       });
 
       repos.push(...response.data);
@@ -173,10 +174,20 @@ class GitHubRepoZipService {
     }
 
     try {
-      await simpleGit().clone(repo.clone_url, repoPath, ['--depth', '1']);
+      // For private repos, use authenticated clone URL
+      let cloneUrl = repo.clone_url;
+      if (repo.private) {
+        // Insert token into URL for authentication
+        const token = process.env.GITHUB_TOKEN;
+        cloneUrl = repo.clone_url.replace('https://', `https://${token}@`);
+      }
+      
+      await simpleGit().clone(cloneUrl, repoPath, ['--depth', '1']);
       return repoPath;
     } catch {
-      const zipUrl = `https://github.com/${this.githubUsername}/${repo.name}/archive/refs/heads/${repo.default_branch || 'main'}.zip`;
+      // Fallback to zip download - use repo owner from full_name for private repos
+      const repoOwner = repo.full_name ? repo.full_name.split('/')[0] : this.githubUsername;
+      const zipUrl = `https://github.com/${repoOwner}/${repo.name}/archive/refs/heads/${repo.default_branch || 'main'}.zip`;
       const zipPath = path.join(downloadPath, `${repo.name}.zip`);
       
       await this.downloadFile(zipUrl, zipPath);
