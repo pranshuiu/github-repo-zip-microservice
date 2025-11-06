@@ -36,10 +36,39 @@ class GitHubRepoZipService {
       GOOGLE_DRIVE_REDIRECT_URI || 'https://developers.google.com/oauthplayground'
     );
 
+    // Set refresh token (access token will auto-refresh as needed)
     oauth2Client.setCredentials({ 
+      refresh_token: GOOGLE_DRIVE_REFRESH_TOKEN,
       access_token: process.env.ACCESS_TOKEN,
-      refresh_token: GOOGLE_DRIVE_REFRESH_TOKEN });
-    this.drive = google.drive({ version: 'v3', auth: oauth2Client });
+    });
+
+    // Keep a reference and listen for refreshed tokens
+    this.oauth2Client = oauth2Client;
+    this.oauth2Client.on('tokens', (tokens) => {
+      if (tokens.access_token) {
+        // update in-memory token so subsequent calls use fresh token
+        this.oauth2Client.setCredentials({
+          refresh_token: GOOGLE_DRIVE_REFRESH_TOKEN,
+          access_token: tokens.access_token,
+        });
+      }
+    });
+
+    this.drive = google.drive({ version: 'v3', auth: this.oauth2Client });
+  }
+
+  async withAuthRetry(fn) {
+    try {
+      return await fn();
+    } catch (err) {
+      const status = err?.code || err?.response?.status;
+      if (status === 401 || status === 403) {
+        // Force-get a fresh access token and retry once
+        await this.oauth2Client.getAccessToken();
+        return await fn();
+      }
+      throw err;
+    }
   }
 
   async ensureDirectories() {
@@ -145,32 +174,32 @@ class GitHubRepoZipService {
     //   requestBody.parents = [process.env.GOOGLE_DRIVE_FOLDER_ID];
     // }
 
-    const response = await this.drive.files.create({
+    const response = await this.withAuthRetry(() => this.drive.files.create({
       requestBody,
       media: {
         mimeType: 'application/zip',
         body: fs.createReadStream(filePath),
       },
       // fields: 'id, name, webViewLink, webContentLink',
-    });
+    }));
 
     return response.data;
   }
 
   async deleteFileFromGoogleDrive(fileId) {
-    await this.drive.files.delete({ fileId });
+    await this.withAuthRetry(() => this.drive.files.delete({ fileId }));
   }
 
   async generatePublicUrl(fileId) {
-    await this.drive.permissions.create({
+    await this.withAuthRetry(() => this.drive.permissions.create({
       fileId,
       requestBody: { role: 'reader', type: 'anyone' },
-    });
+    }));
 
-    const result = await this.drive.files.get({
+    const result = await this.withAuthRetry(() => this.drive.files.get({
       fileId,
       fields: 'webViewLink, webContentLink',
-    });
+    }));
 
     return result.data;
   }
