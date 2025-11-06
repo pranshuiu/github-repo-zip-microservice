@@ -18,6 +18,7 @@ class GitHubRepoZipService {
     this.githubUsername = process.env.GITHUB_USERNAME;
     this.tempDir = path.join(__dirname, 'temp');
     this.zipDir = path.join(__dirname, 'zips');
+    this.accessTokenFile = path.join(__dirname, 'access_token.txt');
     
     // Initialize Google Drive
     this.initGoogleDrive();
@@ -36,25 +37,92 @@ class GitHubRepoZipService {
       GOOGLE_DRIVE_REDIRECT_URI || 'https://developers.google.com/oauthplayground'
     );
 
+    // Load access token from file only
+    const savedAccessToken = this.readAccessTokenFromFile();
+
     // Set refresh token (access token will auto-refresh as needed)
     oauth2Client.setCredentials({ 
       refresh_token: GOOGLE_DRIVE_REFRESH_TOKEN,
-      access_token: process.env.ACCESS_TOKEN,
+      access_token: savedAccessToken || undefined,
     });
 
     // Keep a reference and listen for refreshed tokens
     this.oauth2Client = oauth2Client;
     this.oauth2Client.on('tokens', (tokens) => {
       if (tokens.access_token) {
-        // update in-memory token so subsequent calls use fresh token
+        // Update in-memory token and save to file
         this.oauth2Client.setCredentials({
           refresh_token: GOOGLE_DRIVE_REFRESH_TOKEN,
           access_token: tokens.access_token,
         });
+        this.saveAccessTokenToFile(tokens.access_token);
       }
     });
 
     this.drive = google.drive({ version: 'v3', auth: this.oauth2Client });
+    this.refreshToken = GOOGLE_DRIVE_REFRESH_TOKEN;
+  }
+
+  readAccessTokenFromFile() {
+    try {
+      if (fs.existsSync(this.accessTokenFile)) {
+        const token = fs.readFileSync(this.accessTokenFile, 'utf8').trim();
+        return token || null;
+      }
+    } catch (error) {
+      console.error('Error reading access token from file:', error.message);
+    }
+    return null;
+  }
+
+  saveAccessTokenToFile(accessToken) {
+    try {
+      fs.writeFileSync(this.accessTokenFile, accessToken, 'utf8');
+      console.log('Access token saved to file');
+    } catch (error) {
+      console.error('Error saving access token to file:', error.message);
+    }
+  }
+
+  async validateAccessToken() {
+    try {
+      // Try to make a simple API call to validate the token
+      await this.drive.files.list({
+        pageSize: 1,
+        fields: 'files(id)',
+      });
+      return true;
+    } catch (error) {
+      const status = error?.code || error?.response?.status;
+      if (status === 401 || status === 403) {
+        return false;
+      }
+      // For other errors, assume token might be valid (network issues, etc.)
+      return true;
+    }
+  }
+
+  async ensureValidAccessToken() {
+    const isValid = await this.validateAccessToken();
+    if (!isValid) {
+      console.log('Access token is invalid, refreshing...');
+      try {
+        // getAccessToken() will automatically refresh the token if needed
+        const accessToken = await this.oauth2Client.getAccessToken();
+        if (accessToken) {
+          // The token is already set in the client, but we save it to file
+          // The 'tokens' event listener will also save it, but this ensures it's saved immediately
+          const tokenString = typeof accessToken === 'string' ? accessToken : accessToken.token || accessToken;
+          this.saveAccessTokenToFile(tokenString);
+          console.log('Access token refreshed successfully');
+        }
+      } catch (error) {
+        console.error('Error refreshing access token:', error.message);
+        throw new Error('Failed to refresh access token');
+      }
+    } else {
+      console.log('Access token is valid');
+    }
   }
 
   async withAuthRetry(fn) {
@@ -190,6 +258,80 @@ class GitHubRepoZipService {
     await this.withAuthRetry(() => this.drive.files.delete({ fileId }));
   }
 
+  async listBackupFiles() {
+    try {
+      let allFiles = [];
+      let pageToken = null;
+
+      do {
+        const response = await this.withAuthRetry(() => this.drive.files.list({
+          q: "mimeType='application/zip' and trashed=false",
+          fields: 'nextPageToken, files(id, name, createdTime, modifiedTime)',
+          pageSize: 1000,
+          pageToken: pageToken,
+          orderBy: 'modifiedTime desc',
+        }));
+
+        if (response.data.files) {
+          allFiles.push(...response.data.files);
+        }
+        pageToken = response.data.nextPageToken;
+      } while (pageToken);
+
+      return allFiles;
+    } catch (error) {
+      console.error('Error listing backup files:', error.message);
+      throw error;
+    }
+  }
+
+  async cleanupOldBackups() {
+    try {
+      console.log('Starting cleanup of old backup files...');
+      const files = await this.listBackupFiles();
+      
+      if (files.length === 0) {
+        console.log('No backup files found in Google Drive');
+        return { deleted: 0, kept: 0 };
+      }
+
+      const now = new Date();
+      const twoDaysAgo = new Date(now.getTime() - (2 * 24 * 60 * 60 * 1000)); // 2 days ago
+      
+      let deleted = 0;
+      let kept = 0;
+      const errors = [];
+
+      for (const file of files) {
+        try {
+          // Use modifiedTime if available, otherwise use createdTime
+          const fileDate = file.modifiedTime ? new Date(file.modifiedTime) : new Date(file.createdTime);
+          
+          if (fileDate < twoDaysAgo) {
+            await this.deleteFileFromGoogleDrive(file.id);
+            console.log(`Deleted old backup: ${file.name} (${fileDate.toISOString().split('T')[0]})`);
+            deleted++;
+          } else {
+            kept++;
+          }
+        } catch (error) {
+          console.error(`Error deleting file ${file.name}:`, error.message);
+          errors.push({ file: file.name, error: error.message });
+        }
+      }
+
+      console.log(`Cleanup completed: ${deleted} files deleted, ${kept} files kept`);
+      if (errors.length > 0) {
+        console.warn(`Failed to delete ${errors.length} files`);
+      }
+
+      return { deleted, kept, errors };
+    } catch (error) {
+      console.error('Error during cleanup:', error.message);
+      throw error;
+    }
+  }
+
   async generatePublicUrl(fileId) {
     await this.withAuthRetry(() => this.drive.permissions.create({
       fileId,
@@ -215,6 +357,9 @@ class GitHubRepoZipService {
   }
 
   async run() {
+    // Validate and refresh access token before running
+    await this.ensureValidAccessToken();
+    
     await this.ensureDirectories();
     const repos = await this.getAllRepositories();
     
@@ -222,8 +367,15 @@ class GitHubRepoZipService {
       await this.processRepository(repo);
     }
 
+    // Cleanup old backups (older than 2 days)
+    const cleanupResult = await this.cleanupOldBackups();
+
     await fs.emptyDir(this.tempDir);
-    return { success: true, reposProcessed: repos.length };
+    return { 
+      success: true, 
+      reposProcessed: repos.length,
+      cleanup: cleanupResult 
+    };
   }
 }
 

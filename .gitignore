@@ -6,3 +6,4 @@ zips/
 credentials.json
 *.log
 .DS_Store
+access_token.txt
